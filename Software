@@ -25,3 +25,482 @@ properties (Access = private)
         Tiempo_BPM_Historial = []; % Guarda el tiempo asociado a cada BPM
         BPM_Base = 0;              % Valor promedio de BPM durante calibración
     end
+
+
+
+
+classdef AppBiopack < matlab.apps.AppBase
+
+    % Properties that correspond to app components
+    properties (Access = public)
+        UIFigure               matlab.ui.Figure
+        MNFLabel               matlab.ui.control.Label
+        AlertaLabel            matlab.ui.control.Label
+        BPMLabel               matlab.ui.control.Label
+        ArchivoEditField       matlab.ui.control.EditField
+        ArchivoEditFieldLabel  matlab.ui.control.Label
+        SubirECG               matlab.ui.control.Button
+        MonitorDeFatigaEnTiempoRealLabel  matlab.ui.control.Label
+        MNF                    matlab.ui.control.UIAxes
+        EMG                    matlab.ui.control.UIAxes
+        ECG                    matlab.ui.control.UIAxes
+    end
+
+    
+    properties (Access = private)
+        fs = 2000;              %Frecuencia de muestro 
+        d_ECG                   %Señal ECG importada         
+        d_EMG                   %Señal EMG importada  
+        tiempo                  %Vector de tiempo
+        
+        AnalisisTimer           %Timer para actualizar la GUI
+        MuestraActual = 1;      %Indice de la muestra actual
+        VentanaMuestras         %Duración de la ventana movil
+ 
+        lineaEMG                %Linea animada para ECG
+        lineaECG                %Linea animada para EMG
+        lineaMDF                %Linea animada para MDF
+
+        MDF_Base = 0;              % Guarda el estado muscular sano (MDF del 1er segundo)
+        ContadorSegundos = 1;      % Rastrea qué segundo de señal toca calcular (STFT) -- segundos procesados
+        BPMActual = 0;             % Almacena los latidos actuales
+        UltimoTiempoPico = 0;      % Ultimo latido detectado
+ 
+        MDF_Historial = [];        % Un valor de MDF por cada segundo de señal procesado -- Historial de MDF
+        Tiempo_MNF_Historial = []; % Eje de tiempo (en segundos) asociado al historial
+        EstadoFatiga = false;      % Bandera persistente: true mientras dure la fatiga
+
+        BPM_Historial = [];        % Guarda los valores de BPM detectados
+        Tiempo_BPM_Historial = []; % Guarda el tiempo asociado a cada BPM
+        BPM_Base = 0;              % Valor promedio de BPM durante calibración
+    end
+    
+    methods (Access = private)
+        
+        function actualizarVentanaMovil(app, src, event)
+
+            % 1. Determinar el rango de la ventana actual
+            idxInicio = app.MuestraActual;
+            idxFin = app.MuestraActual + app.VentanaMuestras;
+
+            % Condición de finalización segura
+            if idxFin > length(app.d_ECG)
+                if ~isempty(app.AnalisisTimer) && isvalid(app.AnalisisTimer)
+                    stop(app.AnalisisTimer);
+                    delete(app.AnalisisTimer);
+                    uialert(app.UIFigure, 'Análisis de señal completado.', 'Fin', 'Icon', 'info');
+                end
+                return;
+            end
+
+            % 2. Extraer los bloques de datos de 2 segundos (solo para graficar)
+            tiempoVentana = app.tiempo(idxInicio:idxFin);
+            ecgVentana    = app.d_ECG(idxInicio:idxFin);
+            emgVentana    = app.d_EMG(idxInicio:idxFin);
+
+
+            % DETECCIÓN DE BPM (ECG) con calibración de 8 segundos
+
+            umbralQRS = 0.5 * max(ecgVentana);
+            tiempoMinimoEntreLatidos = 0.4;
+            % Detecta picos QRS en la señal ECG usando un umbral y distancia mínima entre latidos.
+            [picosMax, idxPicos] = findpeaks(ecgVentana, 'MinPeakHeight', umbralQRS, 'MinPeakDistance', tiempoMinimoEntreLatidos*app.fs);
+
+            if ~isempty(picosMax)
+                tiempoDelPico = tiempoVentana(idxPicos(1));
+                if (tiempoDelPico - app.UltimoTiempoPico) > tiempoMinimoEntreLatidos
+                    if app.UltimoTiempoPico > 0
+                        %Calcula BPM instantáneo a partir del intervalo RR
+                        intervaloRR = tiempoDelPico - app.UltimoTiempoPico;
+                        bpmInstantaneo = 60 / intervaloRR;
+
+                        % Guardar BPM en historial
+                        app.BPM_Historial(end+1) = bpmInstantaneo;
+                        app.Tiempo_BPM_Historial(end+1) = app.ContadorSegundos;
+
+                        % --- Calibración BPM ---
+                        if app.ContadorSegundos < 8
+                            % Fase de calibración: acumular valores
+                            app.BPMLabel.Text = "BPM: Calibrando...";
+                        elseif app.ContadorSegundos == 8 && length(app.BPM_Historial) >= 5
+                            % Calcular base con los valores acumulados (mínimo 5)
+                            app.BPM_Base = mean(app.BPM_Historial);
+                            app.BPMLabel.Text = sprintf('BPM base: %.0f', app.BPM_Base);
+
+                        else
+                            % Después de calibración: mostrar BPM suavizado
+                            if app.BPMActual == 0
+                                app.BPMActual = bpmInstantaneo;
+                            else
+                                %Suaviza el BPM con un promedio exponencial para evitar saltos bruscos.
+                                app.BPMActual = (0.7 * app.BPMActual) + (0.3 * bpmInstantaneo);
+                            end
+                            app.BPMLabel.Text = sprintf('BPM: %.0f | Umbral: %.0f', app.BPMActual, app.BPM_Base);
+                        end
+
+                    end
+                    app.UltimoTiempoPico = tiempoDelPico;
+                end
+            end
+
+            % ==========================================================
+            % MDF SEGUNDO A SEGUNDO con animatedline
+            % ==========================================================
+            segundoDisponible = floor(idxFin / app.fs);
+            if segundoDisponible >= app.ContadorSegundos
+                idxIni_s = (app.ContadorSegundos - 1) * app.fs + 1;
+                idxFin_s = app.ContadorSegundos * app.fs;
+
+                if idxFin_s <= length(app.d_EMG)
+                    segmentoEMG = app.d_EMG(idxIni_s:idxFin_s);
+                    segmentoEMG = segmentoEMG - mean(segmentoEMG);
+
+                    N = length(segmentoEMG);
+                    ventanaHamming = 0.54 - 0.46*cos(2*pi*(0:N-1)'/(N-1));
+                    segmentoVentaneado = segmentoEMG .* ventanaHamming;
+
+                    %Valor del tamaño de fft
+                    NFFT = 2^nextpow2(N);
+                    %Obtiene el espectro de potencia del EMG mediante FFT.
+                    fftSeg = fft(segmentoVentaneado, NFFT);
+                    P2 = abs(fftSeg / N).^2;
+                    P1 = P2(1:NFFT/2+1);
+                    P1(2:end-1) = 2*P1(2:end-1);
+                    f = app.fs * (0:(NFFT/2)) / NFFT;
+
+                    idxRango = (f >= 10 & f <= 450);
+                    f_util = f(idxRango);
+                    P_util = P1(idxRango);
+
+                    if ~isempty(P_util) && sum(P_util) > 0
+                        % Calcula la MDF: frecuencia donde la energía acumulada alcanza el 50% del total.
+                        energiaAcumulada = cumsum(P_util);
+                        energiaTotal = energiaAcumulada(end);
+                        idxMediana = find(energiaAcumulada >= energiaTotal/2, 1, 'first');
+                        mdfSegundo = f_util(idxMediana);
+
+                        % Guarda los valores en el historial
+                        app.MDF_Historial(end+1) = mdfSegundo;
+                        app.Tiempo_MNF_Historial(end+1) = app.ContadorSegundos;
+
+                        % Actualizar animatedline MDF
+                        if ~isempty(app.lineaMDF) && isvalid(app.lineaMDF)
+                            clearpoints(app.lineaMDF);
+                            addpoints(app.lineaMDF, app.Tiempo_MNF_Historial, app.MDF_Historial);
+                            xlim(app.MNF, [max(0, app.ContadorSegundos-10) app.ContadorSegundos]);
+                        end
+
+                        % Mostrar MDF actual y la base promedio (si ya existe)
+                        if app.MDF_Base > 0
+                            umbralFatiga = 0.75 * app.MDF_Base;
+                            app.MNFLabel.Text = sprintf('MDF actual: %.1f Hz | Umbral: %.1f Hz', mdfSegundo, umbralFatiga);
+                        else
+                            app.MNFLabel.Text = sprintf('MDF actual: %.1f Hz | Umbral: --', mdfSegundo);
+                        end
+
+                        if app.ContadorSegundos < 8
+                            % Calibración
+                            app.EstadoFatiga = false;
+                            app.AlertaLabel.Text = 'Estado Músculo: Calibrando...';
+                            app.AlertaLabel.FontColor = [0.5 0.5 0.5];
+                        elseif app.ContadorSegundos == 8 && length(app.MDF_Historial) >= 8
+                            % Calcular base en el segundo 8
+                            app.MDF_Base = mean(app.MDF_Historial(1:8));
+                            app.EstadoFatiga = false;
+                            app.AlertaLabel.Text = 'Estado Músculo: Normal';
+                            app.AlertaLabel.FontColor = [0 0.6 0];
+                        else
+                            % Después de calibración: detección de fatiga
+                            condicionBPM = app.BPMActual > app.BPM_Base;             % BPM por encima del umbral
+                            condicionMDF = mdfSegundo < (0.75 * app.MDF_Base);   % MDF por debajo del umbral
+
+                            app.EstadoFatiga = condicionBPM && condicionMDF;         % Ambas condiciones deben cumplirse
+
+                            if app.EstadoFatiga
+                                app.AlertaLabel.Text = 'FATIGA DETECTADA';
+                                app.AlertaLabel.FontColor = [1 0 0];
+                                beep;
+                            else
+                                app.AlertaLabel.Text = 'Estado Músculo: Normal';
+                                app.AlertaLabel.FontColor = [0 0.6 0];
+                            end
+                        end
+                        % Avanzar contador
+                        app.ContadorSegundos = app.ContadorSegundos + 1;
+                    end
+                end
+            end
+
+
+            % ACTUALIZAR LAS GRÁFICAS
+
+            if ~isempty(app.lineaECG) && isvalid(app.lineaECG)
+                clearpoints(app.lineaECG);
+                addpoints(app.lineaECG, tiempoVentana, ecgVentana);
+                ymin = min(ecgVentana); ymax = max(ecgVentana);
+                if isfinite(ymin) && isfinite(ymax) && ymin < ymax
+                    ylim(app.ECG, [ymin ymax]);
+                else
+                    ylim(app.ECG, [-1 1]);
+                end
+                xlim(app.ECG, [tiempoVentana(1) tiempoVentana(end)]);
+            end
+
+            if ~isempty(app.lineaEMG) && isvalid(app.lineaEMG)
+                clearpoints(app.lineaEMG);
+                addpoints(app.lineaEMG, tiempoVentana, emgVentana);
+                ymin = min(emgVentana); ymax = max(emgVentana);
+                if isfinite(ymin) && isfinite(ymax) && ymin < ymax
+                    ylim(app.EMG, [ymin ymax]);
+                else
+                    ylim(app.EMG, [-1 1]);
+                end
+                xlim(app.EMG, [tiempoVentana(1) tiempoVentana(end)]);
+            end
+
+
+            drawnow limitrate;
+            app.MuestraActual = app.MuestraActual + (0.1 * app.fs);
+
+        end
+
+    end
+
+    % Callbacks that handle component events
+    methods (Access = private)
+
+        % Button pushed function: SubirECG
+        function SubirECGButtonPushed(app, event)
+       
+            % 1. Abrir explorador sin restricciones (Muestra todo)
+            [archivo, ruta] = uigetfile('.', 'Seleccionar archivo de datos BIOPAC');
+            % Si se cancela la selección
+            if isequal(archivo, 0)
+                return;
+            end
+
+            % 2. Mostrar la ruta correcta
+            rutaCompleta = fullfile(ruta, archivo);
+            app.ArchivoEditField.Value = rutaCompleta;
+            try
+                % 3. Leer el archivo (BIOPAC separado por Tabs)
+                matrizDatos = readmatrix(rutaCompleta);
+
+                % Verificación
+                if isempty(matrizDatos) || size(matrizDatos, 2) < 2
+                    error('El archivo esta vacio o no tiene al menos 2 columnas');
+                end
+
+                % 4. Guardar los datos en tus propiedades
+                app.d_ECG = matrizDatos(:, 1);
+                emgCrudo = matrizDatos(:, 2);
+                app.d_EMG = emgCrudo - mean(emgCrudo);
+
+                % 5. Calcular el número de muestras y crear el vector de tiempo
+                numMuestras = length(app.d_ECG);
+                app.tiempo = (0:numMuestras-1)' / app.fs;
+
+                % 6. Configurar parámetros de la ventana móvil (2 segundos de duración)
+                app.VentanaMuestras = 2 * app.fs;
+                app.MuestraActual = 1; % Reiniciar el contador al inicio
+
+                % Reiniciar variables de control interno
+                app.UltimoTiempoPico = 0;
+                app.BPMActual = 0;
+                app.ContadorSegundos = 1;
+                app.MDF_Base = 0;
+                app.MDF_Historial = [];
+                app.Tiempo_MNF_Historial = [];
+                app.EstadoFatiga = false;
+                app.BPM_Base = 0;
+                app.BPM_Historial = [];
+
+                app.BPMLabel.Text = "BPM: --";
+                app.AlertaLabel.Text = "Estado Músculo: Analizando...";
+                app.AlertaLabel.FontColor = [0 0 0];
+                app.MNFLabel.Text = "MNF actual: -- Hz";
+
+                % Limpiar los ejes antes de empezar la simulación
+
+                % ECG
+                cla(app.ECG);
+                app.lineaECG = animatedline(app.ECG, 'Color', [0.85 0.33 0.1], 'LineWidth', 1);
+                title(app.ECG, 'Señal de ECG en Tiempo Real');
+                xlabel(app.ECG, 'Tiempo (s)');
+                ylabel(app.ECG, 'Amplitud (mV)');
+
+                % Verificación segura de límites ECG
+                ymin = min(app.d_ECG);
+                ymax = max(app.d_ECG);
+                if ~isempty(ymin) && ~isempty(ymax) && isfinite(ymin) && isfinite(ymax) && ymin < ymax
+                    ylim(app.ECG, [ymin ymax]);
+                else
+                    ylim(app.ECG, [-1 1]); % valores por defecto
+                end
+
+                % EMG
+                cla(app.EMG);
+                app.lineaEMG = animatedline(app.EMG, 'Color', [0 0.45 0.74], 'LineWidth', 1);
+                title(app.EMG, 'Señal de EMG en Tiempo Real');
+                xlabel(app.EMG, 'Tiempo (s)');
+                ylabel(app.EMG, 'Amplitud (mV)');
+
+                % Verificación segura de límites EMG
+                ymin = min(app.d_EMG);
+                ymax = max(app.d_EMG);
+                if ~isempty(ymin) && ~isempty(ymax) && isfinite(ymin) && isfinite(ymax) && ymin < ymax
+                    ylim(app.EMG, [ymin ymax]);
+                else
+                    ylim(app.EMG, [-1 1]);
+                end
+
+                cla(app.MNF);
+                app.lineaMDF = animatedline(app.MNF, "Color", [0.49 0.18 0.56] ,'LineWidth', 1.5, 'Marker', 'o', 'MarkerFaceColor', [0.49 0.18 0.56]);
+                title(app.MNF, 'Evolucion de la MDF');
+                xlabel(app.MNF, 'Tiempo(s)');
+                ylabel(app.MNF, 'MNF(Hz)');
+
+
+                % ==========================================================
+                % 7. CONTROL DEL TIMER AUTOMÁTICO
+                % ==========================================================
+                if ~isempty(app.AnalisisTimer) && isvalid(app.AnalisisTimer)
+                    stop(app.AnalisisTimer);
+                    delete(app.AnalisisTimer);
+                    app.AnalisisTimer = [];
+                    return;
+                end
+
+                % Configuramos el timer para que refresque la pantalla cada 50 ms
+                app.AnalisisTimer = timer('ExecutionMode', 'fixedRate', 'Period', 0.1, ...
+                    'TimerFcn', @(src, event) actualizarVentanaMovil(app, src, event), ...
+                    'ErrorFcn', @(src, event) uialert(app.UIFigure, ...
+                    ['Error en el análisis: ' event.Data.message], 'Error en tiempo real', 'Icon', 'error'));
+
+                % ¡Arrancar la simulación!
+                start(app.AnalisisTimer);
+            catch ME
+                uialert(app.UIFigure, ['Error al leer el archivo o iniciar: ' ME.message], 'Error', 'Icon', 'error');
+            end
+    
+        end
+    end
+
+    % Component initialization
+    methods (Access = private)
+
+        % Create UIFigure and components
+        function createComponents(app)
+
+            % Create UIFigure and hide until all components are created
+            app.UIFigure = uifigure('Visible', 'off');
+            app.UIFigure.Position = [100 100 825 601];
+            app.UIFigure.Name = 'MATLAB App';
+
+            % Create ECG
+            app.ECG = uiaxes(app.UIFigure);
+            title(app.ECG, 'ECG')
+            xlabel(app.ECG, 'Tiempo')
+            ylabel(app.ECG, 'Amplitud (mV)')
+            zlabel(app.ECG, 'Z')
+            app.ECG.FontName = 'Arial';
+            app.ECG.FontWeight = 'bold';
+            app.ECG.Position = [437 283 330 202];
+
+            % Create EMG
+            app.EMG = uiaxes(app.UIFigure);
+            title(app.EMG, 'EMG')
+            xlabel(app.EMG, 'Tiempo')
+            ylabel(app.EMG, 'Amplitud (mV)')
+            zlabel(app.EMG, 'Z')
+            app.EMG.FontName = 'Arial';
+            app.EMG.FontWeight = 'bold';
+            app.EMG.Position = [438 45 331 206];
+
+            % Create MNF
+            app.MNF = uiaxes(app.UIFigure);
+            title(app.MNF, 'Evolución de la MNF')
+            xlabel(app.MNF, 'Tiempo (s)')
+            ylabel(app.MNF, 'MNF (Hz)')
+            zlabel(app.MNF, 'Z')
+            app.MNF.Position = [78 45 300 185];
+
+            % Create MonitorDeFatigaEnTiempoRealLabel
+            app.MonitorDeFatigaEnTiempoRealLabel = uilabel(app.UIFigure);
+            app.MonitorDeFatigaEnTiempoRealLabel.HorizontalAlignment = 'center';
+            app.MonitorDeFatigaEnTiempoRealLabel.FontName = 'Bookman';
+            app.MonitorDeFatigaEnTiempoRealLabel.FontSize = 48;
+            app.MonitorDeFatigaEnTiempoRealLabel.FontWeight = 'bold';
+            app.MonitorDeFatigaEnTiempoRealLabel.Position = [16 529 801 63];
+            app.MonitorDeFatigaEnTiempoRealLabel.Text = 'Monitor De Fatiga En Tiempo Real';
+
+            % Create SubirECG
+            app.SubirECG = uibutton(app.UIFigure, 'push');
+            app.SubirECG.ButtonPushedFcn = createCallbackFcn(app, @SubirECGButtonPushed, true);
+            app.SubirECG.Position = [240 471 100 22];
+            app.SubirECG.Text = 'Importar';
+
+            % Create ArchivoEditFieldLabel
+            app.ArchivoEditFieldLabel = uilabel(app.UIFigure);
+            app.ArchivoEditFieldLabel.HorizontalAlignment = 'center';
+            app.ArchivoEditFieldLabel.FontName = 'Bookman';
+            app.ArchivoEditFieldLabel.FontSize = 14;
+            app.ArchivoEditFieldLabel.Position = [47 471 52 22];
+            app.ArchivoEditFieldLabel.Text = 'Archivo';
+
+            % Create ArchivoEditField
+            app.ArchivoEditField = uieditfield(app.UIFigure, 'text');
+            app.ArchivoEditField.FontSize = 14;
+            app.ArchivoEditField.Position = [93 471 140 22];
+
+            % Create BPMLabel
+            app.BPMLabel = uilabel(app.UIFigure);
+            app.BPMLabel.FontSize = 18;
+            app.BPMLabel.FontWeight = 'bold';
+            app.BPMLabel.Position = [48 283 377 87];
+            app.BPMLabel.Text = 'BPM: --';
+
+            % Create AlertaLabel
+            app.AlertaLabel = uilabel(app.UIFigure);
+            app.AlertaLabel.FontSize = 18;
+            app.AlertaLabel.FontWeight = 'bold';
+            app.AlertaLabel.Position = [48 355 377 87];
+            app.AlertaLabel.Text = 'Estado Músculo: normal';
+
+            % Create MNFLabel
+            app.MNFLabel = uilabel(app.UIFigure);
+            app.MNFLabel.FontSize = 18;
+            app.MNFLabel.FontWeight = 'bold';
+            app.MNFLabel.Position = [48 229 377 87];
+            app.MNFLabel.Text = 'MDF';
+
+            % Show the figure after all components are created
+            app.UIFigure.Visible = 'on';
+        end
+    end
+
+    % App creation and deletion
+    methods (Access = public)
+
+        % Construct app
+        function app = AppBiopack
+
+            % Create UIFigure and components
+            createComponents(app)
+
+            % Register the app with App Designer
+            registerApp(app, app.UIFigure)
+
+            if nargout == 0
+                clear app
+            end
+        end
+
+        % Code that executes before app deletion
+        function delete(app)
+
+            % Delete UIFigure when app is deleted
+            delete(app.UIFigure)
+        end
+    end
+end

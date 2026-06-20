@@ -1,0 +1,27 @@
+properties (Access = private)
+        fs = 2000;              %Frecuencia de muestro 
+        d_ECG                   %Señal ECG importada         
+        d_EMG                   %Señal EMG importada  
+        tiempo                  %Vector de tiempo
+        
+        AnalisisTimer           %Timer para actualizar la GUI
+        MuestraActual = 1;      %Indice de la muestra actual
+        VentanaMuestras         %Duración de la ventana movil
+ 
+        lineaEMG                %Linea animada para ECG
+        lineaECG                %Linea animada para EMG
+        lineaMDF                %Linea animada para MDF
+
+        MDF_Base = 0;              % Guarda el estado muscular sano (MDF del 1er segundo)
+        ContadorSegundos = 1;      % Rastrea qué segundo de señal toca calcular (STFT) -- segundos procesados
+        BPMActual = 0;             % Almacena los latidos actuales
+        UltimoTiempoPico = 0;      % Ultimo latido detectado
+ 
+        MDF_Historial = [];        % Un valor de MDF por cada segundo de señal procesado -- Historial de MDF
+        Tiempo_MNF_Historial = []; % Eje de tiempo (en segundos) asociado al historial
+        EstadoFatiga = false;      % Bandera persistente: true mientras dure la fatiga
+
+        BPM_Historial = [];        % Guarda los valores de BPM detectados
+        Tiempo_BPM_Historial = []; % Guarda el tiempo asociado a cada BPM
+        BPM_Base = 0;              % Valor promedio de BPM durante calibración
+    end
